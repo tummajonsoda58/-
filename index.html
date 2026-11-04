@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign2Speak AI</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:#f5f1e8;color:#162333}
+    header{background:#15324b;color:#fff;padding:16px 22px;display:flex;align-items:center;gap:14px}
+    header h1{margin:0;font-size:26px}
+    header span{opacity:.85}
+    main{display:grid;grid-template-columns:1fr 360px;gap:18px;padding:18px;min-height:calc(100vh - 72px)}
+    .camera{background:#000;border-radius:16px;overflow:hidden;position:relative;min-height:600px;box-shadow:0 8px 28px #0002}
+    video{display:none}
+    canvas{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+    .panel{background:#fff;border-radius:16px;padding:18px;box-shadow:0 8px 28px #0001}
+    .result{background:#eef6fb;border-radius:14px;padding:16px;margin-bottom:14px}
+    .result .word{font-size:30px;font-weight:700;color:#0b7258;min-height:44px}
+    .muted{color:#687384;font-size:13px}
+    button{width:100%;padding:12px 14px;margin:5px 0;border:0;border-radius:10px;background:#1b5e8f;color:#fff;font-weight:600;cursor:pointer;font-size:15px}
+    button.secondary{background:#667788}
+    button.danger{background:#a94747}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    input{width:100%;padding:11px;border:1px solid #cbd5df;border-radius:10px;font-size:16px;margin:6px 0 10px}
+    .row{display:flex;gap:8px}
+    .row button{flex:1}
+    hr{border:0;border-top:1px solid #e6e9ed;margin:16px 0}
+    .pill{display:inline-block;background:#e8eef5;border-radius:999px;padding:5px 9px;margin:3px;font-size:12px}
+    .status{position:absolute;left:14px;top:14px;background:#0009;color:#fff;padding:8px 10px;border-radius:9px;font-size:13px}
+    .tips{font-size:13px;line-height:1.5;background:#fff8df;border-radius:10px;padding:10px;margin-top:12px}
+    @media(max-width:900px){main{grid-template-columns:1fr}.camera{min-height:420px}.panel{width:auto}}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Sign2Speak AI</h1>
+  <span>ภาษามือ → ข้อความ → เสียงพูด</span>
+</header>
+
+<main>
+  <section class="camera">
+    <div id="cameraStatus" class="status">กำลังเตรียมกล้อง...</div>
+    <video id="video" playsinline></video>
+    <canvas id="canvas" width="960" height="720"></canvas>
+  </section>
+
+  <aside class="panel">
+    <h2 style="margin-top:0">ผลการตรวจจับ</h2>
+    <div class="result">
+      <div id="predWord" class="word">ยังไม่ตรวจพบ</div>
+      <div id="confidence" class="muted">ความมั่นใจ: -</div>
+    </div>
+
+    <button id="speakBtn">🔊 พูดคำที่ตรวจพบ</button>
+    <label class="muted"><input id="autoSpeak" type="checkbox" checked style="width:auto;margin-right:6px">พูดอัตโนมัติเมื่อท่านิ่ง</label>
+
+    <hr>
+    <h3>สอนท่าภาษามือ</h3>
+    <div class="muted">พิมพ์คำ เช่น สวัสดี / ขอบคุณ / น้ำ</div>
+    <input id="labelInput" placeholder="พิมพ์คำที่ต้องการสอน">
+    <button id="captureBtn">เก็บตัวอย่างท่านี้ 40 ภาพ</button>
+    <button id="saveBtn" class="secondary">บันทึกข้อมูลไว้ในเครื่อง</button>
+    <button id="loadBtn" class="secondary">โหลดข้อมูลที่เคยบันทึก</button>
+    <button id="clearBtn" class="danger">ล้างข้อมูลทั้งหมด</button>
+
+    <div id="classes" style="margin-top:10px"></div>
+
+    <div class="tips">
+      <b>เริ่มต้น:</b> สอนอย่างน้อย 2 คำก่อน เช่น “สวัสดี” และ “ขอบคุณ”
+      แล้วถือท่าค้างหน้ากล้อง โปรแกรมจะเทียบกับตัวอย่างที่คุณสอนไว้
+    </div>
+  </aside>
+</main>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('cameraStatus');
+const predWord = document.getElementById('predWord');
+const confidenceEl = document.getElementById('confidence');
+const labelInput = document.getElementById('labelInput');
+const classesEl = document.getElementById('classes');
+const autoSpeak = document.getElementById('autoSpeak');
+
+let latestFeature = null;
+let samples = []; // {label, feat}
+let captureLeft = 0;
+let captureLabel = "";
+let lastCaptureAt = 0;
+let stableHistory = [];
+let lastSpoken = "";
+let lastSpokenAt = 0;
+let currentWord = "";
+
+function dist(a,b){
+  let s=0;
+  for(let i=0;i<a.length;i++){ const d=a[i]-b[i]; s+=d*d; }
+  return Math.sqrt(s);
+}
+
+function normalizeLandmarks(multi){
+  if(!multi || multi.length===0) return null;
+  const hands = multi.slice(0,2).map(hand => hand.map(p => [p.x,p.y,p.z]));
+  // sort by wrist x so ordering is stable
+  hands.sort((a,b)=>a[0][0]-b[0][0]);
+
+  let all = hands.flat();
+  let cx=0, cy=0, cz=0;
+  for(const p of all){cx+=p[0];cy+=p[1];cz+=p[2];}
+  cx/=all.length; cy/=all.length; cz/=all.length;
+
+  let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+  for(const p of all){minx=Math.min(minx,p[0]);maxx=Math.max(maxx,p[0]);miny=Math.min(miny,p[1]);maxy=Math.max(maxy,p[1]);}
+  const scale=Math.max(maxx-minx,maxy-miny,0.001);
+
+  const out=[];
+  for(let h=0;h<2;h++){
+    if(h<hands.length){
+      for(const p of hands[h]) out.push((p[0]-cx)/scale,(p[1]-cy)/scale,(p[2]-cz)/scale);
+    }else{
+      for(let i=0;i<63;i++) out.push(0);
+    }
+  }
+  return out;
+}
+
+function classify(feat){
+  if(!feat || samples.length<2) return {label:null, conf:0};
+  const labels=[...new Set(samples.map(s=>s.label))];
+  if(labels.length<2) return {label:null, conf:0};
+
+  const scored = samples.map(s=>({label:s.label,d:dist(feat,s.feat)})).sort((a,b)=>a.d-b.d).slice(0,7);
+  const votes={};
+  for(const x of scored){
+    const w=1/(x.d+1e-6);
+    votes[x.label]=(votes[x.label]||0)+w;
+  }
+  const ordered=Object.entries(votes).sort((a,b)=>b[1]-a[1]);
+  const total=ordered.reduce((a,b)=>a+b[1],0);
+  return {label:ordered[0][0], conf:ordered[0][1]/total};
+}
+
+function speak(text){
+  if(!text) return;
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang='th-TH';
+  u.rate=0.95;
+  const voices=speechSynthesis.getVoices();
+  const thai=voices.find(v => (v.lang||'').toLowerCase().startsWith('th'));
+  if(thai) u.voice=thai;
+  speechSynthesis.speak(u);
+}
+
+function updateClasses(){
+  const counts={};
+  samples.forEach(s=>counts[s.label]=(counts[s.label]||0)+1);
+  classesEl.innerHTML = Object.entries(counts).map(([k,v])=>`<span class="pill">${k}: ${v}</span>`).join('');
+  if(samples.length===0) classesEl.innerHTML='<span class="muted">ยังไม่มีข้อมูล</span>';
+}
+
+document.getElementById('speakBtn').onclick=()=>speak(currentWord);
+
+document.getElementById('captureBtn').onclick=()=>{
+  const label=labelInput.value.trim();
+  if(!label){alert('พิมพ์คำที่ต้องการสอนก่อน');return;}
+  if(!latestFeature){alert('ยังไม่พบมือในกล้อง');return;}
+  captureLabel=label;
+  captureLeft=40;
+  lastCaptureAt=0;
+  statusEl.textContent=`กำลังเก็บท่า "${label}"`;
+};
+
+document.getElementById('saveBtn').onclick=()=>{
+  localStorage.setItem('sign2speak_samples', JSON.stringify(samples));
+  alert('บันทึกข้อมูลไว้ในเบราว์เซอร์เครื่องนี้แล้ว');
+};
+
+document.getElementById('loadBtn').onclick=()=>{
+  const raw=localStorage.getItem('sign2speak_samples');
+  if(!raw){alert('ยังไม่มีข้อมูลที่เคยบันทึก');return;}
+  try{samples=JSON.parse(raw)||[];updateClasses();alert('โหลดข้อมูลแล้ว');}catch(e){alert('โหลดข้อมูลไม่สำเร็จ');}
+};
+
+document.getElementById('clearBtn').onclick=()=>{
+  if(confirm('ล้างตัวอย่างทั้งหมดจริงหรือไม่?')){
+    samples=[];localStorage.removeItem('sign2speak_samples');updateClasses();
+  }
+};
+
+function onResults(results){
+  ctx.save();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(results.image,0,0,canvas.width,canvas.height);
+
+  if(results.multiHandLandmarks){
+    for(const lm of results.multiHandLandmarks){
+      drawConnectors(ctx,lm,HAND_CONNECTIONS,{color:'#00e6a8',lineWidth:4});
+      drawLandmarks(ctx,lm,{color:'#ffffff',lineWidth:1,radius:3});
+    }
+  }
+
+  latestFeature = normalizeLandmarks(results.multiHandLandmarks);
+
+  if(captureLeft>0 && latestFeature){
+    const now=performance.now();
+    if(now-lastCaptureAt>70){
+      samples.push({label:captureLabel,feat:[...latestFeature]});
+      captureLeft--;
+      lastCaptureAt=now;
+      statusEl.textContent=`กำลังเก็บ "${captureLabel}" เหลือ ${captureLeft} ภาพ`;
+      updateClasses();
+      if(captureLeft===0){
+        statusEl.textContent=`เก็บ "${captureLabel}" ครบแล้ว`;
+        localStorage.setItem('sign2speak_samples', JSON.stringify(samples));
+      }
+    }
+  }
+
+  const r=classify(latestFeature);
+  if(r.label && r.conf>=0.60){
+    stableHistory.push(r.label);
+    if(stableHistory.length>10) stableHistory.shift();
+    const count=stableHistory.filter(x=>x===r.label).length;
+
+    if(count>=7){
+      currentWord=r.label;
+      predWord.textContent=r.label;
+      confidenceEl.textContent=`ความมั่นใจ: ${Math.round(r.conf*100)}%`;
+      const now=Date.now();
+      if(autoSpeak.checked && (lastSpoken!==r.label || now-lastSpokenAt>3000)){
+        speak(r.label); lastSpoken=r.label; lastSpokenAt=now;
+      }
+    }else{
+      predWord.textContent='กำลังวิเคราะห์...';
+      confidenceEl.textContent=`ความมั่นใจ: ${Math.round(r.conf*100)}%`;
+    }
+  }else{
+    if(!latestFeature){
+      predWord.textContent='ไม่พบมือ';
+      confidenceEl.textContent='ความมั่นใจ: -';
+      stableHistory=[];
+      lastSpoken="";
+    }else{
+      predWord.textContent='กำลังวิเคราะห์...';
+      confidenceEl.textContent=`ความมั่นใจ: ${Math.round((r.conf||0)*100)}%`;
+    }
+  }
+
+  ctx.restore();
+}
+
+async function start(){
+  try{
+    const hands = new Hands({locateFile:(file)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({
+      maxNumHands:2,
+      modelComplexity:1,
+      minDetectionConfidence:0.55,
+      minTrackingConfidence:0.55
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(video,{
+      onFrame:async()=>{await hands.send({image:video});},
+      width:960,height:720
+    });
+    await camera.start();
+    statusEl.textContent='กล้องพร้อมใช้งาน';
+  }catch(e){
+    console.error(e);
+    statusEl.textContent='เปิดกล้องไม่สำเร็จ';
+    alert('เปิดกล้องไม่สำเร็จ กรุณาอนุญาต Camera ในเบราว์เซอร์ และปิดโปรแกรมอื่นที่ใช้กล้องอยู่');
+  }
+}
+
+speechSynthesis.getVoices();
+updateClasses();
+start();
+</script>
+</body>
+</html>
